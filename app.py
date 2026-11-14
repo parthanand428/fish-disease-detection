@@ -59,7 +59,7 @@ st.markdown(
     }
     .metric-card h2 {
         margin: 0;
-        color: #0f172a;
+        color: #0f172a !important;
         font-size: 1.65rem;
     }
     .disclaimer-box {
