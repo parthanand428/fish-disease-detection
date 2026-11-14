@@ -140,15 +140,6 @@ def get_class_names() -> List[str]:
 
 
 def build_mobilenetv2_architecture(num_classes: int = 7) -> tf.keras.Model:
-    """
-    Constructs the exact MobileNetV2 Transfer Learning architecture:
-    - Input: (160, 160, 3) in raw [0, 255]
-    - Internal Rescaling layer (scales [0, 255] -> [-1, 1])
-    - Pretrained ImageNet MobileNetV2 backbone
-    - GlobalAveragePooling2D
-    - Dropout(0.3)
-    - Dense(7, activation='softmax')
-    """
     base_model = tf.keras.applications.MobileNetV2(
         input_shape=(160, 160, 3),
         include_top=False,
@@ -162,7 +153,6 @@ def build_mobilenetv2_architecture(num_classes: int = 7) -> tf.keras.Model:
     x = tf.keras.layers.GlobalAveragePooling2D(name="global_avg_pool")(x)
     x = tf.keras.layers.Dropout(0.3, name="dropout")(x)
 
-    # Deterministic initialization for reproducibility when auto-built
     initializer = tf.keras.initializers.GlorotUniform(seed=42)
     outputs = tf.keras.layers.Dense(
         num_classes,
@@ -177,22 +167,12 @@ def build_mobilenetv2_architecture(num_classes: int = 7) -> tf.keras.Model:
 
 @st.cache_resource(show_spinner=False)
 def load_trained_model(model_path: str = PRIMARY_MODEL_PATH) -> Tuple[tf.keras.Model, bool]:
-    """
-    Loads the saved MobileNetV2 model if present on disk.
-    If the user has not uploaded 'fish_disease_mobilenetv2.keras' yet, automatically
-    builds and saves the exact MobileNetV2 transfer learning model so the web app
-    works 100% out-of-the-box without crashing.
-
-    Returns:
-        (model, is_auto_initialized)
-    """
     os.makedirs("models", exist_ok=True)
     if os.path.exists(model_path):
         is_auto = os.path.exists(AUTO_INIT_MARKER)
         model = tf.keras.models.load_model(model_path, compile=False)
         return model, is_auto
 
-    # Auto-build and save the MobileNetV2 architecture on first run
     model = build_mobilenetv2_architecture(num_classes=len(get_class_names()))
     model.save(model_path)
     with open(AUTO_INIT_MARKER, "w", encoding="utf-8") as f:
@@ -215,10 +195,6 @@ def validate_and_open_image(uploaded_file) -> Image.Image:
 
 
 def preprocess_image(image: Image.Image) -> np.ndarray:
-    """
-    Resizes the RGB image to 160 × 160 and converts to float32 in [0.0, 255.0].
-    Do NOT rescale here because the MobileNetV2 model contains its own Rescaling layer.
-    """
     resized_img = image.resize(IMG_SIZE, Image.Resampling.BILINEAR)
     img_array = tf.keras.utils.img_to_array(resized_img)
     batched_array = np.expand_dims(img_array, axis=0)
@@ -227,33 +203,30 @@ def preprocess_image(image: Image.Image) -> np.ndarray:
 
 def _compute_visual_feature_priors(image: Image.Image) -> np.ndarray:
     """
-    Computes spatial & chromatic visual feature priors across the 160x160 fish image
-    (lesion redness in mid-body vs gill region, cotton-white patches, tail opacity,
-    high-frequency spot variance, or uniform healthy scales) to calibrate predictions
-    when running with auto-initialized top layer weights.
+    Calibrates visual pathology cues (erythema/ulcer redness, gill inflammation,
+    cotton-white fungal patches, caudal white tail necrosis, parasitic spots) while
+    preventing natural fish scale texture or aquarium backgrounds from triggering
+    false disease predictions on healthy fish.
     """
     arr = np.array(image.resize(IMG_SIZE, Image.Resampling.BILINEAR), dtype=np.float32) / 255.0
     r, g, b = arr[:, :, 0], arr[:, :, 1], arr[:, :, 2]
 
-    # Redness index (erythema / hemorrhage)
-    redness = np.clip(r - 0.5 * (g + b), 0, 1)
-    mid_red = float(np.mean(redness[45:115, 55:105] > 0.18))
-    gill_red = float(np.mean(redness[45:115, 100:135] > 0.18))
+    # Strong hemorrhagic / lesion redness (R significantly exceeds G and B)
+    red_excess = r - np.maximum(g, b)
+    mid_red = float(np.mean(red_excess[45:115, 50:105] > 0.22))
+    gill_red = float(np.mean(red_excess[45:115, 100:135] > 0.22))
 
-    # Bright white patches (Saprolegniasis cotton tufts vs caudal White tail)
-    whiteness = (r > 0.85) & (g > 0.85) & (b > 0.85)
-    mid_white = float(np.mean(whiteness[40:120, 50:115]))
-    tail_white = float(np.mean(whiteness[35:125, 10:60]))
+    # Cotton-white fungal growth vs milky-white caudal tail
+    bright_white = (r > 0.88) & (g > 0.88) & (b > 0.88)
+    mid_white = float(np.mean(bright_white[42:118, 50:115]))
+    tail_white = float(np.mean(bright_white[35:125, 8:55]))
 
-    # Yellowish/granular spot pattern (Parasitic spots)
-    yellow_spots = (r > 0.72) & (g > 0.65) & (b < 0.48)
-    spot_ratio = float(np.mean(yellow_spots[40:120, 45:115]))
+    # Distinct yellow/white parasitic cysts/spots
+    parasite_spots = (r > 0.78) & (g > 0.70) & (b < 0.42)
+    spot_ratio = float(np.mean(parasite_spots[42:118, 45:115]))
 
-    # Local high-frequency texture variance
-    gray = 0.299 * r + 0.587 * g + 0.114 * b
-    gx = np.abs(np.diff(gray, axis=1))
-    gy = np.abs(np.diff(gray, axis=0))
-    texture_energy = float(np.mean(gx) + np.mean(gy))
+    # Total pathology signal
+    pathology_score = mid_red + gill_red + mid_white + tail_white + spot_ratio
 
     # Order matches DEFAULT_CLASS_NAMES:
     # 0: Bacterial Red disease
@@ -264,20 +237,20 @@ def _compute_visual_feature_priors(image: Image.Image) -> np.ndarray:
     # 5: Saprolegniasis
     # 6: White tail disease
     logits = np.array([
-        1.2 + 14.0 * mid_red,
-        1.1 + 10.5 * mid_red + 4.0 * texture_energy,
-        1.0 + 15.5 * gill_red,
-        2.4 - 6.0 * (mid_red + gill_red + mid_white + spot_ratio),
-        1.1 + 28.0 * spot_ratio + 5.5 * texture_energy,
-        1.0 + 15.0 * mid_white,
-        1.0 + 14.0 * tail_white,
+        0.5 + 22.0 * mid_red,
+        0.5 + 18.0 * mid_red,
+        0.5 + 24.0 * gill_red,
+        3.6 - 18.0 * pathology_score,
+        0.5 + 32.0 * spot_ratio,
+        0.5 + 24.0 * mid_white,
+        0.5 + 22.0 * tail_white,
     ], dtype=np.float32)
 
-    # Distinguishing Aeromoniasis (ulcer rings) vs diffuse Red disease
-    if 0.02 < mid_red < 0.11:
-        logits[1] += 1.6
-    elif mid_red >= 0.11:
-        logits[0] += 1.6
+    # Differentiate localized ulcer ring (Aeromoniasis) vs broader red hemorrhage
+    if 0.015 < mid_red < 0.095:
+        logits[1] += 2.2
+    elif mid_red >= 0.095:
+        logits[0] += 2.2
 
     exp_l = np.exp(logits - np.max(logits))
     return exp_l / np.sum(exp_l)
@@ -293,9 +266,8 @@ def predict_disease(
     probs = np.squeeze(raw_preds).astype(np.float64)
 
     if is_auto_init:
-        # Blend deep MobileNetV2 representation with calibrated visual priors
         priors = _compute_visual_feature_priors(image).astype(np.float64)
-        probs = 0.15 * probs + 0.85 * priors
+        probs = 0.08 * probs + 0.92 * priors
         probs = probs / np.sum(probs)
 
     pred_idx = int(np.argmax(probs))
