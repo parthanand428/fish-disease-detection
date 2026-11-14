@@ -1,0 +1,22 @@
+Model: MobileNetV2 Transfer Learning (fish_disease_mobilenetv2.keras)
+Dataset: Freshwater Fish Disease Aquaculture in South Asia (Test Split: 697 images)
+==================================================================================
+                                   precision    recall  f1-score   support
+
+            Bacterial Red disease     0.9118    0.9300    0.9208       100
+Bacterial diseases - Aeromoniasis     0.9140    0.8500    0.8808       100
+           Bacterial gill disease     0.8602    0.8000    0.8290       100
+                     Healthy Fish     0.8725    0.8900    0.8812       100
+               Parasitic diseases     0.7477    0.8081    0.7767        99
+                   Saprolegniasis     0.9756    0.8081    0.8840        99
+               White tail disease     0.8305    0.9899    0.9032        99
+
+                         accuracy                         0.8680       697
+                        macro avg     0.8732    0.8680    0.8680       697
+                     weighted avg     0.8733    0.8680    0.8680       697
+==================================================================================
+Verified Summary Metrics:
+  - Test Accuracy      : 86.80%
+  - Weighted Precision : 87.33%
+  - Weighted Recall    : 86.80%
+  - Weighted F1-Score  : 86.80%
