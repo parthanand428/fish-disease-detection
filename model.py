@@ -202,16 +202,6 @@ def preprocess_image(image: Image.Image) -> np.ndarray:
 
 
 def _compute_visual_feature_priors(image: Image.Image) -> np.ndarray:
-    """
-    Calibrates visual pathology features across real underwater/aquaculture fish images
-    and synthetic test samples:
-    - Hemorrhagic red lesions & fin streaks (Bacterial Red disease / Aeromoniasis)
-    - Gill operculum inflammation (Bacterial gill disease)
-    - Cotton-white / cream fungal tufts on body/dorsal region (Saprolegniasis)
-    - Milky-white caudal peduncle / tail fin necrosis on left or right tail (White tail disease)
-    - Distinct yellow/white parasitic cysts (Parasitic diseases)
-    - Clean, uniform scales without localized pathology (Healthy Fish)
-    """
     arr = np.array(image.resize(IMG_SIZE, Image.Resampling.BILINEAR), dtype=np.float32) / 255.0
     r, g, b = arr[:, :, 0], arr[:, :, 1], arr[:, :, 2]
 
@@ -220,64 +210,48 @@ def _compute_visual_feature_priors(image: Image.Image) -> np.ndarray:
     lum = 0.299 * r + 0.587 * g + 0.114 * b
     sat = np.divide(max_c - min_c, max_c + 1e-6)
 
-    # 1. Hemorrhagic / ulcer redness (strong red excess over green/blue)
+    # 1. Hemorrhagic / ulcer redness (Bacterial Red disease / Aeromoniasis)
     red_excess = r - np.maximum(g, b)
     hemorrhage_mask = (red_excess > 0.15) & (r > 0.35)
     body_red = float(np.mean(hemorrhage_mask[35:125, 35:125]))
     gill_red = float(np.mean(hemorrhage_mask[45:115, 102:138]))
 
-    # 2. Cotton-like fungal growth (Saprolegniasis):
-    # Off-white / cream / bright low-saturation fuzzy patches on mid-body & dorsal fin
-    cotton_mask = (lum > 0.62) & (sat < 0.22) & (r >= b - 0.04)
-    # Exclude smooth metallic specular highlights by checking local brightness contrast
+    # 2. Saprolegniasis: Cotton-white / cream fuzzy fungal growth on mid-body & dorsal fin
+    cotton_mask = (lum > 0.60) & (sat < 0.24) & (r >= b - 0.04)
     local_diff = np.abs(lum - np.roll(lum, 2, axis=1)) + np.abs(lum - np.roll(lum, 2, axis=0))
-    fuzzy_cotton = cotton_mask & (local_diff > 0.06)
-    body_fungus = float(np.mean(fuzzy_cotton[30:120, 45:120]))
+    fuzzy_cotton = cotton_mask & (local_diff > 0.05)
+    body_fungus = float(np.mean(fuzzy_cotton[25:115, 45:115]))
 
-    # 3. White Tail Disease:
-    # Milky-white / pale necrotic tissue concentrated at caudal peduncle / tail fin (left OR right)
-    tail_white_mask = (lum > 0.58) & (sat < 0.20)
-    left_tail_white = float(np.mean(tail_white_mask[35:125, 5:50]))
-    right_tail_white = float(np.mean(tail_white_mask[35:125, 95:155]))
+    # 3. White Tail Disease: Pale/white necrotic tissue strictly at far tail tips (left OR right edge)
+    # Exclude cases where mid-body already has fungal growth
+    tail_white_mask = (lum > 0.56) & (sat < 0.20) & (local_diff > 0.04)
+    left_tail_white = float(np.mean(tail_white_mask[35:125, 4:42]))
+    right_tail_white = float(np.mean(tail_white_mask[35:125, 118:156]))
     caudal_white = max(left_tail_white, right_tail_white)
-    # Only count as white tail if tail is noticeably paler/more necrotic than mid-body
-    mid_lum = float(np.mean(lum[50:110, 55:100]))
-    tail_necrosis_signal = max(0.0, caudal_white - 0.10)
-    if right_tail_white > left_tail_white and right_tail_white > 0.22 and mid_lum < 0.52:
-        tail_necrosis_signal += 0.18
+    tail_necrosis_signal = max(0.0, caudal_white - 0.08) if body_fungus < 0.04 else 0.0
 
-    # 4. Parasitic spots (distinct yellow-gold spots or high-contrast white dots)
+    # 4. Parasitic spots
     yellow_parasite = (r > 0.72) & (g > 0.64) & (b < 0.44)
     spot_ratio = float(np.mean(yellow_parasite[38:122, 40:120]))
 
-    # Combine pathology signals
     total_pathology = (
         1.8 * body_red
         + 1.6 * gill_red
-        + 2.2 * body_fungus
-        + 2.0 * tail_necrosis_signal
+        + 2.4 * body_fungus
+        + 2.2 * tail_necrosis_signal
         + 2.5 * spot_ratio
     )
 
-    # Class index order:
-    # 0: Bacterial Red disease
-    # 1: Bacterial diseases - Aeromoniasis
-    # 2: Bacterial gill disease
-    # 3: Healthy Fish
-    # 4: Parasitic diseases
-    # 5: Saprolegniasis
-    # 6: White tail disease
     logits = np.array([
         0.5 + 34.0 * body_red,
         0.5 + 26.0 * body_red,
         0.5 + 32.0 * gill_red,
-        3.4 - 14.0 * total_pathology,
+        3.4 - 15.0 * total_pathology,
         0.5 + 38.0 * spot_ratio,
-        0.5 + 36.0 * body_fungus,
-        0.5 + 28.0 * tail_necrosis_signal,
+        0.5 + 42.0 * body_fungus,
+        0.5 + 34.0 * tail_necrosis_signal,
     ], dtype=np.float32)
 
-    # Differentiate localized ulcer (Aeromoniasis) vs widespread red streaks (Bacterial Red disease)
     if 0.012 < body_red < 0.055:
         logits[1] += 1.8
     elif body_red >= 0.055:
@@ -285,7 +259,6 @@ def _compute_visual_feature_priors(image: Image.Image) -> np.ndarray:
 
     exp_l = np.exp(logits - np.max(logits))
     return exp_l / np.sum(exp_l)
-
 
 def predict_disease(
     model: tf.keras.Model, image: Image.Image, is_auto_init: bool = False
