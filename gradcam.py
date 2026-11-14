@@ -1,8 +1,23 @@
 from typing import Optional, Tuple
+import inspect
 import numpy as np
 import cv2
 from PIL import Image
 import tensorflow as tf
+
+
+def _call_layer_safe(layer, tensor):
+    """
+    Safely invokes a Keras layer in Keras 2 and Keras 3 without triggering
+    'too many positional arguments' on layers whose call() does not take 'training'.
+    """
+    try:
+        sig = inspect.signature(layer.call)
+        if "training" in sig.parameters:
+            return layer(tensor, training=False)
+    except Exception:
+        pass
+    return layer(tensor)
 
 
 def _find_target_conv_layer(model: tf.keras.Model) -> Tuple[Optional[tf.keras.Model], str]:
@@ -44,6 +59,8 @@ def compute_gradcam_heatmap(
             if layer.name == nested_base.name:
                 found_base = True
                 continue
+            if isinstance(layer, tf.keras.layers.InputLayer):
+                continue
             if not found_base:
                 pre_layers.append(layer)
             else:
@@ -51,21 +68,21 @@ def compute_gradcam_heatmap(
 
         target_conv_output = nested_base.get_layer(target_layer_name).output
         base_grad_model = tf.keras.Model(
-            inputs=nested_base.inputs,
+            inputs=nested_base.input,
             outputs=[target_conv_output, nested_base.output],
         )
 
         with tf.GradientTape() as tape:
             x = inputs
             for pre_layer in pre_layers:
-                x = pre_layer(x, training=False)
+                x = _call_layer_safe(pre_layer, x)
 
             conv_outputs, base_out = base_grad_model(x, training=False)
             tape.watch(conv_outputs)
 
             y = base_out
             for post_layer in post_layers:
-                y = post_layer(y, training=False)
+                y = _call_layer_safe(post_layer, y)
 
             preds = y
             if class_index is None:
@@ -74,7 +91,7 @@ def compute_gradcam_heatmap(
 
     else:
         grad_model = tf.keras.Model(
-            inputs=model.inputs,
+            inputs=model.input,
             outputs=[model.get_layer(target_layer_name).output, model.output],
         )
         with tf.GradientTape() as tape:
@@ -85,19 +102,22 @@ def compute_gradcam_heatmap(
             class_channel = preds[:, class_index]
 
     grads = tape.gradient(class_channel, conv_outputs)
-    pooled_grads = tf.reduce_mean(grads, axis=(0, 1, 2))
+    if grads is not None:
+        pooled_grads = tf.reduce_mean(grads, axis=(0, 1, 2))
+        conv_outputs_0 = conv_outputs[0]
+        heatmap = conv_outputs_0 @ pooled_grads[..., tf.newaxis]
+        heatmap = tf.squeeze(heatmap)
+        heatmap = tf.maximum(heatmap, 0)
+        max_val = tf.math.reduce_max(heatmap)
+    else:
+        max_val = 0.0
 
-    conv_outputs = conv_outputs[0]
-    heatmap = conv_outputs @ pooled_grads[..., tf.newaxis]
-    heatmap = tf.squeeze(heatmap)
-
-    heatmap = tf.maximum(heatmap, 0)
-    max_val = tf.math.reduce_max(heatmap)
     if max_val > 0:
         heatmap = heatmap / max_val
     else:
-        # Fallback to mean feature map activation if gradients vanish
-        heatmap = tf.reduce_mean(tf.maximum(conv_outputs, 0), axis=-1)
+        # Fallback to positive feature map activation if gradients are zero
+        conv_outputs_0 = conv_outputs[0]
+        heatmap = tf.reduce_mean(tf.maximum(conv_outputs_0, 0), axis=-1)
         m2 = tf.math.reduce_max(heatmap)
         if m2 > 0:
             heatmap = heatmap / m2
